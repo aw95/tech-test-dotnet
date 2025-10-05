@@ -1,90 +1,79 @@
-﻿using ClearBank.DeveloperTest.Data;
+﻿using ClearBank.DeveloperTest.Common;
+using ClearBank.DeveloperTest.Data.Interfaces;
+using ClearBank.DeveloperTest.Services.Interfaces;
 using ClearBank.DeveloperTest.Types;
-using System.Configuration;
+using Microsoft.Extensions.Logging;
+using System;
 
 namespace ClearBank.DeveloperTest.Services
 {
     public class PaymentService : IPaymentService
     {
+        private readonly IAccountDataStoreFactory _dataStoreFactory;
+        private readonly IPaymentValidatorService _validator;
+        private readonly ILogger<PaymentService> _logger;
+
+        public PaymentService(
+            IAccountDataStoreFactory dataStoreFactory,
+            IPaymentValidatorService validator,
+            ILogger<PaymentService> logger)
+        {
+            _dataStoreFactory = dataStoreFactory ?? throw new ArgumentNullException(nameof(dataStoreFactory));
+            _validator = validator ?? throw new ArgumentNullException(nameof(validator));
+            _logger = logger;
+        }
+
         public MakePaymentResult MakePayment(MakePaymentRequest request)
         {
-            var dataStoreType = ConfigurationManager.AppSettings["DataStoreType"];
+            var result = new MakePaymentResult { Success = false };
 
-            Account account = null;
-
-            if (dataStoreType == "Backup")
+            if (request == null)
             {
-                var accountDataStore = new BackupAccountDataStore();
-                account = accountDataStore.GetAccount(request.DebtorAccountNumber);
-            }
-            else
-            {
-                var accountDataStore = new AccountDataStore();
-                account = accountDataStore.GetAccount(request.DebtorAccountNumber);
+                _logger?.LogWarning("MakePayment called with null request.");
+                return result;
             }
 
-            var result = new MakePaymentResult();
+            var maskedAccountNumber = AccountNumberMasker.Mask(request.DebtorAccountNumber);
 
-            result.Success = true;
-            
-            switch (request.PaymentScheme)
+            try
             {
-                case PaymentScheme.Bacs:
-                    if (account == null)
-                    {
-                        result.Success = false;
-                    }
-                    else if (!account.AllowedPaymentSchemes.HasFlag(AllowedPaymentSchemes.Bacs))
-                    {
-                        result.Success = false;
-                    }
-                    break;
+                var dataStore = _dataStoreFactory.GetDataStore();
+                if (dataStore == null)
+                {
+                    _logger?.LogError("No data store available.");
+                    return result;
+                }
 
-                case PaymentScheme.FasterPayments:
-                    if (account == null)
-                    {
-                        result.Success = false;
-                    }
-                    else if (!account.AllowedPaymentSchemes.HasFlag(AllowedPaymentSchemes.FasterPayments))
-                    {
-                        result.Success = false;
-                    }
-                    else if (account.Balance < request.Amount)
-                    {
-                        result.Success = false;
-                    }
-                    break;
+                var account = dataStore.GetAccount(request.DebtorAccountNumber);
 
-                case PaymentScheme.Chaps:
-                    if (account == null)
-                    {
-                        result.Success = false;
-                    }
-                    else if (!account.AllowedPaymentSchemes.HasFlag(AllowedPaymentSchemes.Chaps))
-                    {
-                        result.Success = false;
-                    }
-                    else if (account.Status != AccountStatus.Live)
-                    {
-                        result.Success = false;
-                    }
-                    break;
-            }
+                // Use validator for all payment types
+                var valid = _validator.Validate(account, request);
+                if (!valid)
+                {
+                    _logger?.LogInformation(
+                        "Validation failed for account ending in {LastFourDigits} and scheme {PaymentScheme}.",
+                        maskedAccountNumber,
+                        request.PaymentScheme);
+                    return result;
+                }
 
-            if (result.Success)
-            {
+                // All validation passed -> perform debit and update
                 account.Balance -= request.Amount;
+                dataStore.UpdateAccount(account);
 
-                if (dataStoreType == "Backup")
-                {
-                    var accountDataStore = new BackupAccountDataStore();
-                    accountDataStore.UpdateAccount(account);
-                }
-                else
-                {
-                    var accountDataStore = new AccountDataStore();
-                    accountDataStore.UpdateAccount(account);
-                }
+                result.Success = true;
+                _logger?.LogInformation(
+                    "Payment of {Amount} from account ending in {LastFourDigits} succeeded.",
+                    request.Amount,
+                    maskedAccountNumber);
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(
+                    ex,
+                    "Unexpected error while trying to make a payment for debtor account ending in {LastFourDigits}.",
+                    maskedAccountNumber);
+                result.Success = false;
             }
 
             return result;
